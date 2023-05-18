@@ -1,0 +1,237 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "../common.glsl"
+#define REPROJECTION_SINGLE_COLOR_CHANNEL
+#define REPROJECTION_MOMENTS
+#include "../reprojection.glsl"
+
+// ------------------------------------------------------------------
+// DEFINES ----------------------------------------------------------
+// ------------------------------------------------------------------
+
+#define NUM_THREADS_X 8
+#define NUM_THREADS_Y 8
+#define RAY_MASK_SIZE_X 8
+#define RAY_MASK_SIZE_Y 4
+
+// ------------------------------------------------------------------
+// INPUTS -----------------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(local_size_x = NUM_THREADS_X, local_size_y = NUM_THREADS_Y, local_size_z = 1) in;
+
+// ------------------------------------------------------------------
+// DESCRIPTOR SETS --------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(set = 0, binding = 0) uniform PerFrameUBO
+{
+    mat4  view_inverse;
+    mat4  proj_inverse;
+    mat4  view_proj_inverse;
+    mat4  prev_view_proj;
+    mat4  view_proj;
+    vec4  cam_pos;
+    vec4  current_prev_jitter;
+    Light light;
+    uint num_frames;
+    uint inverse_scale;
+} globalUBO;
+
+// Input DS
+layout(set = 0, binding = 1) uniform usampler2D inputImage;
+
+// Current Reprojection Write DS
+layout(set = 0, binding = 2, rg16f) uniform writeonly image2D outputImage;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D momentImage;
+layout(set = 0, binding = 4) uniform sampler2D sceneDepth;
+
+layout(set = 0, binding = 5, std430) buffer DenoiseTileData_t
+{
+    ivec2 coord[];
+} DenoiseTileData;
+
+layout(set = 0, binding = 6, std430) buffer DenoiseTileDispatchArgs_t
+{
+    uint num_groups_x;
+    uint num_groups_y;
+    uint num_groups_z;
+} DenoiseTileDispatchArgs;
+
+layout(set = 0, binding = 7, std430) buffer ShadowTileData_t
+{
+    ivec2 coord[];
+} ShadowTileData;
+
+layout(set = 0, binding = 8, std430) buffer ShadowTileDispatchArgs_t
+{
+    uint num_groups_x;
+    uint num_groups_y;
+    uint num_groups_z;
+} ShadowTileDispatchArgs;
+
+// ------------------------------------------------------------------
+// PUSH CONSTANTS ---------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(push_constant) uniform PushConstants
+{
+    float alpha;
+    float moments_alpha;
+    int   g_buffer_mip;
+}
+u_PushConstants;
+
+// ------------------------------------------------------------------
+// SHARED -----------------------------------------------------------
+// ------------------------------------------------------------------
+
+shared uint  g_shadow_hit_masks[3][6];
+shared float g_mean_accumulation[8][24];
+shared uint  g_should_denoise;
+
+// ------------------------------------------------------------------
+// FUNCTIONS --------------------------------------------------------
+// ------------------------------------------------------------------
+
+void populate_cache()
+{
+    if (gl_LocalInvocationID.x < 3 && gl_LocalInvocationID.y < 6)
+    {
+        ivec2 coord                                                        = ivec2(gl_WorkGroupID.x, gl_WorkGroupID.y * 2) - ivec2(1, 2) + ivec2(gl_LocalInvocationID.xy);
+        g_shadow_hit_masks[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = texelFetch(inputImage, coord, 0).x;
+    }
+
+    barrier();
+}
+
+// ------------------------------------------------------------------------
+
+float unpack_shadow_hit_value(ivec2 coord)
+{
+    // Find the global coordinate for the top left corner of the current work group.
+    const ivec2 work_group_start_coord = ivec2(gl_WorkGroupID.xy) * ivec2(NUM_THREADS_X, NUM_THREADS_Y);
+
+    // Find the global coordinate for the top left corner of the cache.
+    const ivec2 cache_start_coord = work_group_start_coord - ivec2(RAY_MASK_SIZE_X, RAY_MASK_SIZE_Y * 2);
+
+    // Compute the local coordinate within the cache for the requested global coordinate.
+    const ivec2 unpacked_cache_coord = coord - cache_start_coord;
+
+    // From the unpacked local coordinate, compute which ray mask the requested hit belongs to.
+    // aka the packed local coordinate.
+    const ivec2 packed_cache_coord = unpacked_cache_coord / ivec2(RAY_MASK_SIZE_X, RAY_MASK_SIZE_Y);
+
+    // From the packed local coordinate, compute the unpacked local coordinate for the start of the current ray mask.
+    const ivec2 mask_start_coord = packed_cache_coord * ivec2(RAY_MASK_SIZE_X, RAY_MASK_SIZE_Y);
+
+    // Find the relative coordinate of the requested sample within the ray mask.
+    const ivec2 relative_mask_coord = unpacked_cache_coord - mask_start_coord;
+
+    // Compute the flattened hit index of the requested sample within the ray mask.
+    const int hit_index = relative_mask_coord.y * RAY_MASK_SIZE_X + relative_mask_coord.x;
+
+    // Use the hit index to bit shift the value from the cache and retrieve the requested sample.
+    return float((g_shadow_hit_masks[packed_cache_coord.x][packed_cache_coord.y] >> hit_index) & 1u);
+}
+
+// ------------------------------------------------------------------
+
+float horizontal_neighborhood_mean(ivec2 coord)
+{
+    float result = 0.0f;
+
+    for (int x = -8; x <= 8; x++)
+        result += unpack_shadow_hit_value(ivec2(coord.x + x, coord.y));
+
+    return result;
+}
+
+// ------------------------------------------------------------------
+
+float neighborhood_mean(ivec2 coord)
+{
+    float top    = horizontal_neighborhood_mean(ivec2(coord.x, coord.y - 8));
+    float middle = horizontal_neighborhood_mean(ivec2(coord.x, coord.y));
+    float bottom = horizontal_neighborhood_mean(ivec2(coord.x, coord.y + 8));
+
+    g_mean_accumulation[gl_LocalInvocationID.x][gl_LocalInvocationID.y]      = top;
+    g_mean_accumulation[gl_LocalInvocationID.x][gl_LocalInvocationID.y + 8]  = middle;
+    g_mean_accumulation[gl_LocalInvocationID.x][gl_LocalInvocationID.y + 16] = bottom;
+
+    barrier();
+
+    const int   radius = 8;
+    const float weight = (float(radius) * 2.0f + 1.0f) * (float(radius) * 2.0f + 1.0f);
+
+    float mean = 0.0f;
+
+    for (int y = 0; y <= 16; y++)
+        mean += g_mean_accumulation[gl_LocalInvocationID.x][gl_LocalInvocationID.y + y];
+
+    return mean / weight;
+}
+
+// ------------------------------------------------------------------
+// MAIN -------------------------------------------------------------
+// ------------------------------------------------------------------
+
+void main()
+{
+    const int g_buffer_mip = 0;
+    g_should_denoise = 0;
+
+    barrier();
+
+    ivec2 current_coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sampler_current_coord = ivec2(gl_GlobalInvocationID.xy) * int(globalUBO.inverse_scale);
+
+    populate_cache();
+    float mean = neighborhood_mean(current_coord);
+    float depth = texelFetch(sceneDepth, sampler_current_coord, g_buffer_mip).r;
+
+    float visibility                 = 0.0f;
+    vec2  output_visibility_variance = vec2(0.0f);
+    vec2  output_moments             = vec2(0.0f);
+    float history_length             = 0.0f;
+
+    if (depth != 1.0f)
+    {
+        visibility = unpack_shadow_hit_value(current_coord);
+
+        // compute first two moments of luminance
+        output_moments.r = visibility;
+        output_moments.g = output_moments.r * output_moments.r;
+
+        output_visibility_variance.y = max(0.0f, output_moments.g - output_moments.r * output_moments.r);
+        output_visibility_variance.x = visibility;
+    }
+
+    // Temporal integration
+    imageStore(momentImage, current_coord, vec4(output_moments, history_length, 0.0f));
+    imageStore(outputImage, current_coord, vec4(output_visibility_variance, 0.0f, 0.0f));
+
+    // If all the threads are in shadow, skip the A-Trous filter.
+    if (depth != 1.0f && output_visibility_variance.x > 0.0f)
+        g_should_denoise = 1;
+
+    barrier();
+
+    if (gl_LocalInvocationIndex == 0)
+    {
+        if (g_should_denoise == 1)
+        {
+            uint idx                   = atomicAdd(DenoiseTileDispatchArgs.num_groups_x, 1);
+            DenoiseTileData.coord[idx] = current_coord;
+        }
+        else
+        {
+            uint idx                  = atomicAdd(ShadowTileDispatchArgs.num_groups_x, 1);
+            ShadowTileData.coord[idx] = current_coord;
+        }
+    }
+}
+
+// ------------------------------------------------------------------
