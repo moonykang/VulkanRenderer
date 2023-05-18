@@ -3,7 +3,7 @@
 ## Windows
 
 ### Requirements
-- Visual Studio 2019
+- Visual Studio 2022
 - VulkanSDK (with VULKAN_SDK as a system environment)
 
 To generate Visual studio project solution, run
