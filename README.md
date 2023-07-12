@@ -1,4 +1,9 @@
 # Little Renderer
+It is my prace renderer for Hybrid ray tracing with Vulkan API.
+This proejct works on both Windows & Android platform.
+
+![rayquery](captures/rayquery.PNG)
+
 
 ## Windows
 
